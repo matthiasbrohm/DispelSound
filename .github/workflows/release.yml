@@ -1,0 +1,146 @@
+# Baut die ZIP-Dateien und veröffentlicht sie als GitHub-Release.
+#
+# Auslöser:
+# - Änderung der Versionsnummer in DispelSound.toc auf dem Branch main
+#   (gibt es für diese Nummer noch kein Release, wird es automatisch angelegt)
+# - ein neuer Tag oder ein über die Webseite veröffentlichtes Release
+# - von Hand unter "Actions → Release bauen → Run workflow" (dort lässt sich auch wählen, ob die
+#   aktuelle Version nur zu Wago oder nur zu CurseForge noch einmal hochgeladen wird)
+name: Release bauen
+
+on:
+  push:
+    branches: [main]
+    paths: ['DispelSound.toc', '.github/workflows/release.yml']
+    tags: ['*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ziel:
+        description: "Wohin hochladen? (Das GitHub-Release wird immer aktualisiert)"
+        type: choice
+        default: alle
+        options: [alle, wago, curseforge]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version bestimmen
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(sed -n 's/^## Version:[[:space:]]*//p' DispelSound.toc | tr -d '\r' | head -n1)"
+            TAG="$VERSION"
+          fi
+          if [ -z "$VERSION" ]; then echo "Keine Versionsnummer gefunden" >&2; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Bei einer Änderung auf main ohne neue Versionsnummer nichts tun
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "branch" ] \
+             && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG gibt es schon – nichts zu tun."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Kein Release, wenn das Addon nicht sauber lädt oder ein Test fehlschlägt (Ordner tests)
+      - name: Tests
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq luajit >/dev/null
+          luajit tests/run.lua
+
+      - name: ZIP-Dateien bauen
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p build/DispelSound
+          rsync -a ./ build/DispelSound/ \
+            --exclude '.git' --exclude '.github' --exclude 'build' \
+            --exclude '.gitignore' --exclude '.gitattributes' --exclude '.pkgmeta' \
+            --exclude 'tests' --exclude 'media'
+          sed -i "s/^## Version:.*/## Version: $VERSION/" build/DispelSound/DispelSound.toc
+          cd build
+          zip -rq "DispelSound-$VERSION.zip" DispelSound
+          cp "DispelSound-$VERSION.zip" "DispelSound-$VERSION-forever.zip"
+          ls -l
+
+      - name: Release anlegen oder ZIPs anhängen
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/*.zip --clobber
+          else
+            gh release create "$TAG" build/*.zip --target "$GITHUB_SHA" \
+              --title "DispelSound $VERSION" --generate-notes
+          fi
+
+  # Dieselbe Version zusätzlich zu CurseForge und Wago hochladen (BigWigs-Packager).
+  # CurseForge: Secret CF_API_KEY und in der .toc „## X-Curse-Project-ID: …“.
+  # Wago:       Secret WAGO_API_TOKEN und in der .toc „## X-Wago-ID: …“.
+  # Fehlt ein Secret, wird nur dieses Ziel übersprungen; fehlt eine ID in der .toc, ebenso.
+  curseforge:
+    name: CurseForge und Wago
+    needs: release
+    if: needs.release.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    env:
+      CF_API_KEY: ${{ secrets.CF_API_KEY }}
+      WAGO_API_TOKEN: ${{ secrets.WAGO_API_TOKEN }}
+      ZIEL: ${{ github.event.inputs.ziel || 'alle' }}
+    steps:
+      - name: Prüfen, welche Ziele eingerichtet sind
+        id: check
+        run: |
+          [ -n "$CF_API_KEY" ] || echo "Kein CF_API_KEY hinterlegt – CurseForge wird übersprungen."
+          [ -n "$WAGO_API_TOKEN" ] || echo "Kein WAGO_API_TOKEN hinterlegt – Wago wird übersprungen."
+          if [ -z "$CF_API_KEY" ] && [ -z "$WAGO_API_TOKEN" ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.go == 'true'
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          fetch-depth: 0
+
+      # Den Packager direkt aufrufen statt als fertige Action: Bei einem Push auf main
+      # bricht er sonst ab („Found future tag“), weil er auf einen eigenen Tag-Lauf wartet.
+      # Unser Tag entsteht aber erst in diesem Workflow und löst keinen neuen Lauf aus.
+      # „-p 0“ bzw. „-a 0“ schaltet ein Ziel für diesen Lauf ab (Auswahl beim Start von Hand).
+      - name: Zu CurseForge und Wago hochladen
+        if: steps.check.outputs.go == 'true'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/BigWigsMods/packager/v2/release.sh -o "$RUNNER_TEMP/release.sh"
+          ARGS=()
+          case "$ZIEL" in
+            wago) ARGS+=(-p 0) ;;
+            curseforge) ARGS+=(-a 0) ;;
+          esac
+          echo "Ziel: $ZIEL – Packager-Optionen: ${ARGS[*]}"
+          GITHUB_EVENT_NAME=workflow_dispatch bash "$RUNNER_TEMP/release.sh" "${ARGS[@]}"

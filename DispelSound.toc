@@ -1,0 +1,15 @@
+## Interface: 16001
+## Title: DispelSound
+## Notes: Plays a sound when you, a party member or a raid member gets a debuff you can dispel. Works in combat (engine aura sounds).
+## Notes-deDE: Spielt einen Sound, wenn du, ein Gruppen- oder Schlachtzugsmitglied einen Debuff bekommt, den du bannen kannst. Funktioniert im Kampf (Engine-Aura-Sounds).
+## Author: Gilde_Elternabend
+## Version: 1.1.0
+## IconTexture: Interface\AddOns\DispelSound\icon.tga
+## SavedVariables: DispelSoundDB
+## Category: Combat
+## X-License: GPL-2.0
+
+Locale.lua
+Data.lua
+Core.lua
+Options.lua
